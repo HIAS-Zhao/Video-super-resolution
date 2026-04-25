@@ -1,18 +1,18 @@
-# BiSTAVSR: Offset-Aware Bidirectional Spatio-Temporal Aggregation for Remote Sensing Video Super-Resolution
+# BiSTAVSR
 
-These supplementary materials provide the implementation of **BiSTAVSR** for remote sensing video super-resolution (RSVSR).
+This repository provides the implementation of **BiSTAVSR** for remote sensing video super-resolution (RSVSR).
 
-BiSTAVSR is designed for realistic satellite videos with large inter-frame motion, weak local textures, and dense structural details. It combines:
+BiSTAVSR is designed for realistic satellite videos with large inter-frame motion, weak local textures, and dense structural details. The repository includes the core model implementation and training / evaluation pipeline.
 
-- **BiSTA**: Bidirectional Spatio-Temporal Attention Aggregation
-- **OAR**: Offset-Aware Refinement
-- **PHASE**: Pyramidal High-frequency Auxiliary Structure Enhancement
+- The main network architecture
+- Training and evaluation scripts
+- Dataset preparation utilities
 
 ---
 
-## Abstract
+## Notice
 
-Remote sensing videos are a special type of sequential multimedia data and pose distinctive super-resolution challenges due to large platform-induced motion, weak textures, and complex structural details. To address these issues, we propose **BiSTAVSR**, a recurrent remote sensing video super-resolution framework that strengthens local bidirectional aggregation within long-range propagation. Specifically, the proposed method introduces a **Bidirectional Spatio-Temporal Attention Aggregation (BiSTA)** module for enhanced neighboring-frame support, an **Offset-Aware Refinement (OAR)** module for more reliable query-key matching and offset estimation, and a **Pyramidal High-frequency Auxiliary Structure Enhancement (PHASE)** branch for explicit high-frequency reconstruction during upsampling. Experiments on public and real-world datasets demonstrate that BiSTAVSR achieves strong quantitative and visual performance.
+Detailed paper title, abstract, and citation information will be added after the publication process is ready for public release.
 
 ---
 
@@ -24,10 +24,10 @@ Remote sensing videos are a special type of sequential multimedia data and pose 
 
 ## Highlights
 
-- Recurrent RSVSR framework with enhanced local bidirectional aggregation
-- Explicit structural guidance for query-key matching and offset prediction
-- Dual-branch reconstruction with dedicated high-frequency enhancement
-- Effective on both public benchmarks and realistic satellite videos
+- Recurrent RSVSR framework for remote sensing video restoration
+- Support for model training, evaluation, and inference workflows
+- Designed for both public benchmarks and realistic satellite videos
+- Modular codebase built on top of BasicSR
 
 ---
 
@@ -244,5 +244,4 @@ We also thank the authors of related open-source VSR and RSVSR projects for thei
 - [ ] Release testing code
 - [ ] Release pretrained models
 - [ ] Release dataset links
-- [ ] Update paper link after publication
-
+- [ ] Add paper and citation information when ready
