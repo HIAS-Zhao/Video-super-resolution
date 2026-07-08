@@ -310,3 +310,472 @@ class SpatialTemporalTransformer(nn.Module):
         )  # (B,H,W,C)
         x = x + self.mlp(self.norm2(x))
         return x.permute(0, 3, 1, 2).contiguous()
+
+# Module1
+class BiSTA(nn.Module):
+    """Bidirectional Spatio-Temporal Aggregator
+
+    Aggregates temporal information from support frames in a bidirectional
+    manner (forward/backward relative to reference frame). Features from
+    left/right temporal neighborhoods are processed independently through
+    a shared spatio-temporal attention module, then concatenated along
+    the channel dimension for downstream fusion.
+
+    This design enables symmetric temporal modeling while maintaining
+    computational efficiency through parameter sharing.
+
+    Args:
+        feat_channels (int): Input feature channels
+        encoding_dim (int): Internal encoding dimension for attention
+        num_heads (int): Number of attention heads
+        mlp_ratio (float): Expansion ratio for MLP block
+        load_path (str, optional): Path to pretrained weights
+        add_ref_residual (bool): Whether to add reference residual in attention
+        dropout (float): Dropout rate for regularization
+
+    Shape:
+        - ref_feat: (B, C, H, W)
+        - supp_feats: List[(B, C, H, W), ...]
+        - Output: (B, 2C, H, W) or (B, 0, H, W) if no support frames
+    """
+
+    def __init__(
+            self,
+            feat_channels: int,
+            encoding_dim: int = 64,
+            num_heads: int = 8,
+            mlp_ratio: float = 2,
+            load_path: Optional[str] = None,
+            add_ref_residual: bool = True,
+            dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.feat_channels = feat_channels
+        self.encoding_dim = encoding_dim
+        self.num_heads = num_heads
+        self.mlp_ratio = mlp_ratio
+        self.add_ref_residual = add_ref_residual
+
+        # Shared spatio-temporal aggregation module for both directions
+        self.aggregator = SpatialTemporalTransformer(
+            feat_channels=feat_channels,
+            encoding_dim=encoding_dim,
+            num_heads=num_heads // 2,  # Reduce heads for bidirectional sharing
+            mlp_ratio=mlp_ratio,
+            load_path=load_path,
+            add_ref_residual=add_ref_residual,
+            dropout=dropout,
+        )
+
+    def forward(
+            self,
+            ref_feat: torch.Tensor,
+            supp_feats: Optional[List[torch.Tensor]] = None,
+            left_len: Optional[int] = None,
+            supp_value_feats: Optional[List[torch.Tensor]] = None
+    ) -> torch.Tensor:
+        """
+        Bidirectional temporal aggregation with symmetric processing.
+
+        Args:
+            ref_feat: Reference frame features (B, C, H, W)
+            supp_feats: List of support frame features for aggregation
+            left_len: Number of frames to treat as "left" (past) neighborhood.
+                     If None, defaults to min(2, len(supp_feats)//2)
+            supp_value_feats: Optional separate value features for attention.
+                             If None, uses supp_feats directly.
+
+        Returns:
+            torch.Tensor: Aggregated features (B, 2C, H, W) for downstream fusion.
+                         Returns zero tensor if no valid support frames available.
+        """
+        # Handle empty support frame list
+        if supp_feats is None or len(supp_feats) == 0:
+            b, c, h, w = ref_feat.shape
+            return ref_feat.new_zeros(b, c * 2, h, w)
+
+        # Determine temporal split point for bidirectional processing
+        if left_len is None:
+            left_len = min(2, len(supp_feats) // 2)
+        left_len = int(max(left_len, 0))
+
+        # Align value features with query features
+        if supp_value_feats is None:
+            supp_value_feats = supp_feats
+        if len(supp_value_feats) != len(supp_feats):
+            raise ValueError('supp_value_feats length must match supp_feats length.')
+
+        # Split support frames into bidirectional neighborhoods
+        left_feats = supp_feats[:left_len]
+        right_feats = supp_feats[left_len:]
+        left_value_feats = supp_value_feats[:left_len]
+        right_value_feats = supp_value_feats[left_len:]
+
+        # Process each temporal direction independently with shared weights
+        x_l = self.aggregator(ref_feat, left_feats, supp_value_feats=left_value_feats) if len(left_feats) > 0 else None
+        x_r = self.aggregator(ref_feat, right_feats, supp_value_feats=right_value_feats) if len(
+            right_feats) > 0 else None
+
+        # Collect valid directional outputs
+        second_supp = []
+        if x_l is not None:
+            second_supp.append(x_l)
+        if x_r is not None:
+            second_supp.append(x_r)
+
+        # Handle edge cases: no valid outputs or single direction only
+        if len(second_supp) == 0:
+            b, c, h, w = ref_feat.shape
+            return ref_feat.new_zeros(b, c * 2, h, w)
+        if len(second_supp) == 1:
+            # Duplicate single-direction output to maintain 2C channel format
+            second_supp.append(second_supp[0])
+
+        # Concatenate bidirectional features along channel dimension
+        # Output shape: (B, 2C, H, W) ready for fusion with reference features
+        return torch.cat(second_supp, dim=1)
+
+
+# Module2
+
+class OAR(nn.Module):
+    def __init__(self, channels, hidden_ratio=0.5, alpha_init=0.05, eps=1e-6):
+        super().__init__()
+        hidden_channels = max(8, int(channels * hidden_ratio))
+        self.eps = eps
+
+        self.scharr_x = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+        self.scharr_y = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+        self.context = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, kernel_size=1, bias=True),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=True))
+
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid())
+
+        self.alpha = nn.Parameter(torch.full((1, channels, 1, 1), alpha_init))
+        self._init_kernels(channels)
+
+    def _init_kernels(self, channels):
+        scharr_x = torch.tensor(
+            [[-3., 0., 3.], [-10., 0., 10.], [-3., 0., 3.]], dtype=torch.float32)
+        scharr_y = torch.tensor(
+            [[-3., -10., -3.], [0., 0., 0.], [3., 10., 3.]], dtype=torch.float32)
+        gaussian = torch.tensor(
+            [[1., 2., 1.], [2., 4., 2.], [1., 2., 1.]], dtype=torch.float32)
+        gaussian = gaussian / gaussian.sum()
+
+        with torch.no_grad():
+            self.scharr_x.weight.copy_(scharr_x.view(1, 1, 3, 3).repeat(channels, 1, 1, 1))
+            self.scharr_y.weight.copy_(scharr_y.view(1, 1, 3, 3).repeat(channels, 1, 1, 1))
+            self.context.weight.copy_(gaussian.view(1, 1, 3, 3).repeat(channels, 1, 1, 1))
+
+        self.scharr_x.weight.requires_grad = False
+        self.scharr_y.weight.requires_grad = False
+
+    def forward(self, x):
+        edge_x = self.scharr_x(x)
+        edge_y = self.scharr_y(x)
+        edge = torch.sqrt(edge_x * edge_x + edge_y * edge_y + self.eps)
+        context = self.context(x)
+
+        detail = self.fuse(torch.cat([x, edge, context], dim=1))
+        gate = self.gate(detail)
+        return x + self.alpha * gate * detail
+
+# Module3
+class CGF(nn.Module):
+    """Channel-Gated Fusion: adaptive channel response selection + cross-fusion
+
+    Implements channel-wise gating via group normalization and adaptive
+    thresholding, followed by cross-channel information mixing. Designed
+    for fine-grained feature refinement in dual-branch architectures.
+    """
+
+    def __init__(self, channels, group_num=4, gate_threshold=0.5):
+        super().__init__()
+        self.gn = nn.GroupNorm(group_num, channels)
+        self.gate_threshold = gate_threshold
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # Channel-wise response calibration via group normalization
+        gx = self.gn(x)
+
+        # Compute adaptive channel weights for gating
+        w = self.gn.weight.view(1, -1, 1, 1)
+        w = w / (w.abs().sum() + 1e-6)
+        gate = self.sigmoid(gx * w)
+
+        # Adaptive feature partitioning based on response magnitude
+        info = (gate >= self.gate_threshold).float() * gx
+        less = (gate < self.gate_threshold).float() * gx
+
+        # Cross-channel fusion for enhanced information propagation
+        c = info.size(1)
+        if c % 2 != 0:
+            return gx
+
+        i1, i2 = torch.chunk(info, 2, dim=1)
+        l1, l2 = torch.chunk(less, 2, dim=1)
+        out = torch.cat([i1 + l2, i2 + l1], dim=1)
+        return out
+
+
+class CCA(nn.Module):
+    """Compressed Channel Aggregation: hierarchical channel processing with attention
+
+    Implements channel-split compression with hybrid convolution operations
+    and attention-based recalibration. Optimized for efficient feature
+    aggregation while preserving discriminative channel information.
+    """
+
+    def __init__(self, channels, alpha=0.5, squeeze_ratio=2, groups=2):
+        super().__init__()
+        # Hierarchical channel partitioning
+        up_c = int(channels * alpha)
+        low_c = channels - up_c
+        self.up_c = up_c
+        self.low_c = low_c
+
+        # Dimensionality reduction for computational efficiency
+        s_up = max(1, up_c // squeeze_ratio)
+        s_low = max(1, low_c // squeeze_ratio)
+
+        self.squeeze_up = nn.Conv2d(up_c, s_up, 1, bias=False)
+        self.squeeze_low = nn.Conv2d(low_c, s_low, 1, bias=False)
+
+        # Hybrid convolution: group + pointwise for complementary feature mixing
+        self.gwc = nn.Conv2d(s_up, channels, 3, 1, 1, groups=groups, bias=False)
+        self.pwc_up = nn.Conv2d(s_up, channels, 1, bias=False)
+        self.pwc_low = nn.Conv2d(s_low, channels, 1, bias=False)
+
+        # Channel-wise attention for adaptive feature weighting
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # Split channels for hierarchical processing
+        up, low = torch.split(x, [self.up_c, self.low_c], dim=1)
+        up = self.squeeze_up(up)
+        low = self.squeeze_low(low)
+
+        # Complementary feature aggregation via hybrid convolutions
+        y_up = self.gwc(up) + self.pwc_up(up)
+        y_low = self.pwc_low(low)
+
+        # Fuse and apply channel-wise attention
+        y = y_up + y_low
+        att = self.gate(y)
+        return y * att
+
+
+class FEB(nn.Module):
+    """Feature Enhancement Block: collaborative spatial-channel refinement
+
+    Cascades Channel-Gated Fusion (CGF) and Compressed Channel Aggregation
+    (CCA) for joint spatial-channel feature enhancement. Serves as the
+    core refinement unit in parallel high-frequency architectures.
+    """
+
+    def __init__(self, channels, group_num=4, gate_threshold=0.5):
+        super().__init__()
+        self.cgf = CGF(channels, group_num, gate_threshold)
+        self.cca = CCA(channels)
+
+    def forward(self, x):
+        # Sequential spatial then channel refinement
+        return self.cca(self.cgf(x))
+
+
+class SPE(nn.Module):
+    """Structural Prior Extractor: fixed kernels for geometric pattern extraction
+
+    Employs predefined structural kernels to extract geometric discontinuities
+    and spatial patterns. Parameters are frozen to provide stable structural
+    priors without increasing training complexity or overfitting risk.
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        # Predefined structural kernels for orthogonal pattern extraction
+        kx = torch.tensor(
+            [[-3., 0., 3.],
+             [-10., 0., 10.],
+             [-3., 0., 3.]]
+        )
+        ky = torch.tensor(
+            [[-3., -10., -3.],
+             [0., 0., 0.],
+             [3., 10., 3.]]
+        )
+
+        # Depthwise convolution for per-channel structural extraction
+        self.conv_x = nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=False)
+        self.conv_y = nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=False)
+
+        # Initialize with fixed structural priors (non-trainable)
+        with torch.no_grad():
+            self.conv_x.weight.copy_(kx.view(1, 1, 3, 3).repeat(channels, 1, 1, 1))
+            self.conv_y.weight.copy_(ky.view(1, 1, 3, 3).repeat(channels, 1, 1, 1))
+
+        # Freeze parameters to maintain prior stability
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        # Extract orthogonal structural responses and compute magnitude
+        gx = self.conv_x(x)
+        gy = self.conv_y(x)
+        return torch.sqrt(gx * gx + gy * gy + 1e-6)
+
+
+class MDE(nn.Module):
+    """Multi-Direction Encoder: angular-aware feature encoding via rotated kernels
+
+    Implements parallel directional encoders with rotated structural kernels
+    to capture orientation-sensitive patterns. Designed for anisotropic
+    structure awareness in high-frequency enhancement tasks.
+    """
+
+    def __init__(self, in_channels, branch_channels, num_directions=4):
+        super().__init__()
+        # Configurable angular sampling for comprehensive directional coverage
+        angles = [0, 45, 90, 135][:num_directions]
+
+        # Feature dimension reduction for efficient multi-branch processing
+        self.reduce = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, 1, 1, 0, bias=False),
+            nn.LeakyReLU(0.1, inplace=True)
+        )
+        self.branches = nn.ModuleList()
+
+        # Initialize directional encoders with rotated structural kernels
+        for angle in angles:
+            conv = nn.Conv2d(branch_channels, branch_channels, 3, 1, 1,
+                             groups=branch_channels, bias=False)
+            weight = self._rotated_kernel(angle, branch_channels)
+            with torch.no_grad():
+                conv.weight.copy_(weight)
+            self.branches.append(conv)
+
+        # Fusion layer to integrate multi-directional features
+        self.fuse = nn.Conv2d(branch_channels * num_directions, in_channels, 1, bias=True)
+
+    def _rotated_kernel(self, angle, channels):
+        """Generate rotated structural kernel via coordinate transformation"""
+        base = torch.tensor(
+            [[-1., 0., 1.],
+             [-2., 0., 2.],
+             [-1., 0., 1.]]
+        )
+        theta = math.radians(angle)
+        rot = torch.zeros_like(base)
+        center = 1
+
+        # Coordinate rotation for kernel orientation adaptation
+        for i in range(3):
+            for j in range(3):
+                x = j - center
+                y = i - center
+                xr = x * math.cos(theta) - y * math.sin(theta)
+                yr = x * math.sin(theta) + y * math.cos(theta)
+                xi = int(round(xr)) + center
+                yi = int(round(yr)) + center
+                if 0 <= xi < 3 and 0 <= yi < 3:
+                    rot[i, j] = base[yi, xi]
+
+        return rot.view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
+
+    def forward(self, x):
+        # Reduce dimensionality before directional encoding
+        x = self.reduce(x)
+
+        # Parallel directional feature extraction with non-linear activation
+        outs = [F.leaky_relu(branch(x), 0.1, inplace=True) for branch in self.branches]
+        outs = torch.cat(outs, dim=1)
+
+        # Fuse multi-directional features to original channel dimension
+        return self.fuse(outs)
+
+
+class PHASE(nn.Module):
+    """Parallel High-frequency Aware Structure Enhancement
+
+    Integrates three complementary pathways for high-frequency structure
+    enhancement: (1) collaborative spatial-channel refinement, (2) fixed
+    structural prior extraction, and (3) multi-directional geometry encoding.
+    Outputs residual detail features for fine-grained texture restoration.
+
+    This module is designed for dual-branch architectures where one branch
+    handles resolution restoration and this module provides high-frequency
+    detail enhancement through parallel structural cue fusion.
+
+    Args:
+        channels (int): Input/output feature channels
+        res_scale (float): Residual scaling factor for stable training
+    """
+
+    def __init__(self, channels, res_scale=0.1):
+        super().__init__()
+        # Pre-projection for feature alignment
+        self.pre = nn.Conv2d(channels, channels, 1, bias=True)
+
+        # Core feature enhancement block
+        self.feb = FEB(channels)
+
+        # Structural prior branch: fixed kernels for stable geometric cues
+        self.spe = SPE(channels)
+
+        # Multi-directional branch: adaptive angular feature encoding
+        self.mde = MDE(
+            in_channels=channels,
+            branch_channels=max(8, channels // 4),
+            num_directions=4
+        )
+
+        # Multi-cue fusion network
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, 3, 1, 1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(channels, channels, 3, 1, 1)
+        )
+        self.res_scale = res_scale
+
+    def forward(self, x):
+        """
+        Forward pass for parallel high-frequency structure enhancement.
+
+        Args:
+            x (Tensor): Input feature map [B, C, H, W]
+
+        Returns:
+            Tensor: Residual detail features scaled by res_scale,
+                   intended to be fused with upsampling branch outputs
+                   for comprehensive detail restoration.
+        """
+        # Base feature enhancement with residual connection
+        base = self.feb(self.pre(x)) + x
+
+        # Extract complementary structural cues from parallel branches
+        struct_prior = self.spe(base)  # Fixed structural patterns
+        direction_encoding = self.mde(base)  # Adaptive directional features
+
+        # Fuse multi-cue representations for comprehensive high-frequency enhancement
+        detail = self.fuse(torch.cat([base, struct_prior, direction_encoding], dim=1))
+
+        # Scaled residual output for stable gradient flow
+        return self.res_scale * detail
