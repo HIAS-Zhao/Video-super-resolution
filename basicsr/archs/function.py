@@ -1,3 +1,13 @@
+import math
+from typing import List, Optional, Sequence, Union
+
+import torch
+from torch import nn as nn
+from torch.nn import functional as F
+
+__all__ = ['BiSTA', 'OAR', 'PHASE']
+
+
 class Mlp(nn.Module):
     """Swin-style FFN: 1x1 conv -> GELU -> 1x1 conv"""
 
@@ -183,6 +193,7 @@ class SpatialTemporalTransformer(nn.Module):
             self,
             ref_feat,
             supp_feats,
+            supp_value_feats: Optional[Sequence[torch.Tensor]] = None,
             supp_flows: Optional[Union[Sequence[torch.Tensor], torch.Tensor]] = None,
             supp_feats_for_offset: Optional[Sequence[torch.Tensor]] = None,
             supp_dts: Optional[Union[Sequence[int], torch.Tensor]] = None,
@@ -193,6 +204,12 @@ class SpatialTemporalTransformer(nn.Module):
         if N == 0:
             return ref_feat.permute(0, 2, 3, 1).contiguous()  # (B,H,W,C)
 
+        if supp_value_feats is None:
+            supp_value_feats = supp_feats
+        if len(supp_value_feats) != N:
+            raise ValueError(
+                f'supp_value_feats length ({len(supp_value_feats)}) must match supp_feats length ({N}).')
+
         all_feats = [ref_feat] + supp_feats
         all_fused = torch.stack(all_feats, dim=1).permute(0, 1, 3, 4, 2).contiguous()  # (B,N+1,H,W,C)
         norm_feats = self.norm1(all_fused)
@@ -201,12 +218,18 @@ class SpatialTemporalTransformer(nn.Module):
         Q = self.q_proj(norm_feats[:, 0])  # (B,H,W,enc)
         Q = Q.view(B, H, W, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4).contiguous()
 
-        # K,V maps: (B, N, enc, H, W)
-        kv = self.kv_proj(norm_feats[:, 1:])  # (B,N,H,W,2enc)
-        kv = kv.view(B, N, H, W, 2, self.num_heads, self.head_dim).permute(0, 1, 4, 5, 6, 2, 3).contiguous()
-        # -> (B,N,2,heads,dh,H,W)
-        K = kv[:, :, 0]  # (B,N,heads,dh,H,W)
-        V = kv[:, :, 1]  # (B,N,heads,dh,H,W)
+        # OAR-refined support features provide K, while the raw aligned
+        # support features remain the V stream used for propagation.
+        k_proj = self.kv_proj(norm_feats[:, 1:])[..., :self.encoding_dim]
+        K = k_proj.view(B, N, H, W, self.num_heads, self.head_dim).permute(
+            0, 1, 4, 5, 2, 3).contiguous()
+
+        value_feats = torch.stack(list(supp_value_feats), dim=1).permute(
+            0, 1, 3, 4, 2).contiguous()
+        value_feats = self.norm1(value_feats)
+        v_proj = self.kv_proj(value_feats)[..., self.encoding_dim:]
+        V = v_proj.view(B, N, H, W, self.num_heads, self.head_dim).permute(
+            0, 1, 4, 5, 2, 3).contiguous()
 
         # --- Offsets in pixel units: residual + optional coarse flow ---
         # Add them in pixel space first, then normalize once.
@@ -297,6 +320,7 @@ class SpatialTemporalTransformer(nn.Module):
             self,
             ref_feat,
             supp_feats,
+            supp_value_feats: Optional[Sequence[torch.Tensor]] = None,
             supp_flows: Optional[Union[Sequence[torch.Tensor], torch.Tensor]] = None,
             supp_feats_for_offset: Optional[Sequence[torch.Tensor]] = None,
             supp_dts: Optional[Union[Sequence[int], torch.Tensor]] = None,
@@ -304,6 +328,7 @@ class SpatialTemporalTransformer(nn.Module):
         x = self.deformable_attention(
             ref_feat,
             supp_feats,
+            supp_value_feats=supp_value_feats,
             supp_flows=supp_flows,
             supp_feats_for_offset=supp_feats_for_offset,
             supp_dts=supp_dts,
@@ -336,7 +361,7 @@ class BiSTA(nn.Module):
     Shape:
         - ref_feat: (B, C, H, W)
         - supp_feats: List[(B, C, H, W), ...]
-        - Output: (B, 2C, H, W) or (B, 0, H, W) if no support frames
+        - Output: (B, 2C, H, W); empty neighborhoods return zeros
     """
 
     def __init__(
@@ -725,11 +750,10 @@ class PHASE(nn.Module):
     detail enhancement through parallel structural cue fusion.
 
     Args:
-        channels (int): Input/output feature channels
-        res_scale (float): Residual scaling factor for stable training
+        channels (int): Input/output feature channels.
     """
 
-    def __init__(self, channels, res_scale=0.1):
+    def __init__(self, channels):
         super().__init__()
         # Pre-projection for feature alignment
         self.pre = nn.Conv2d(channels, channels, 1, bias=True)
@@ -753,8 +777,6 @@ class PHASE(nn.Module):
             nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(channels, channels, 3, 1, 1)
         )
-        self.res_scale = res_scale
-
     def forward(self, x):
         """
         Forward pass for parallel high-frequency structure enhancement.
@@ -763,9 +785,8 @@ class PHASE(nn.Module):
             x (Tensor): Input feature map [B, C, H, W]
 
         Returns:
-            Tensor: Residual detail features scaled by res_scale,
-                   intended to be fused with upsampling branch outputs
-                   for comprehensive detail restoration.
+            Tensor: Residual detail features. Their final contribution is
+                controlled by the learnable alpha in BiSTAVSR.
         """
         # Base feature enhancement with residual connection
         base = self.feb(self.pre(x)) + x
@@ -777,5 +798,4 @@ class PHASE(nn.Module):
         # Fuse multi-cue representations for comprehensive high-frequency enhancement
         detail = self.fuse(torch.cat([base, struct_prior, direction_encoding], dim=1))
 
-        # Scaled residual output for stable gradient flow
-        return self.res_scale * detail
+        return detail

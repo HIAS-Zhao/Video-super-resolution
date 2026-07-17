@@ -1,19 +1,81 @@
-import os
-import sys
 import torch
-from typing import Optional
+from typing import List, Optional
 from torch import nn as nn
 from torch.nn import functional as F
-from function import *
+
+from basicsr.archs.arch_util import flow_warp
+from basicsr.archs.basicvsr_arch import (
+    ConvResidualBlocks,
+    EDVRFeatureExtractor,
+    KBAFunction,
+    SimpleGate,
+)
+from basicsr.archs.channel_diversity import MultiSpectralAttentionLayer
+from basicsr.archs.spynet_arch import SpyNet
+from basicsr.utils.registry import ARCH_REGISTRY
+
+from .function import BiSTA, OAR, PHASE
+
+
+def SDE(x, att, kernel_size, groups, bias_bank, weight_bank):
+    return KBAFunction.apply(x, att, kernel_size, groups, bias_bank, weight_bank)
+
+
+class MADE(nn.Module):
+    """Multi-Axis Diversity Enhancement retained from the MADNet baseline."""
+
+    def __init__(self, c=64, DW_Expand=2, FFN_Expand=2, nset=64, k=3, gc=4, lightweight=False):
+        super().__init__()
+        self.k = k
+        self.g = c // gc
+        self.w = nn.Parameter(torch.zeros(1, nset, c * c // self.g * k**2))
+        self.b = nn.Parameter(torch.zeros(1, nset, c))
+
+        self.dwconv_k5 = nn.Conv2d(c, c, 5, 1, 2, bias=True)
+        self.channel_diversity = MultiSpectralAttentionLayer(
+            channel=c, dct_w=56, dct_h=56)
+        self.conv1 = nn.Conv2d(c, c, 1, bias=True)
+        self.conv21 = nn.Conv2d(c, c, 3, 1, 1, groups=c, bias=True)
+        self.conv11 = nn.Sequential(
+            nn.Conv2d(c, c, 1, bias=True),
+            nn.Conv2d(c, c, 3, 1, 1, groups=c, bias=True),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(c, 32, 3, 1, 1, groups=32, bias=True),
+            SimpleGate(),
+            nn.Conv2d(16, 64, 1),
+        )
+        self.conv211 = nn.Conv2d(64, 64, 1)
+        self.attgamma = nn.Parameter(torch.full((1, 64, 1, 1), 1e-2))
+        self.ga1 = nn.Parameter(torch.full((1, c, 1, 1), 1e-2))
+        self.fusion = nn.Conv2d(c, c, 1, bias=True)
+
+    def forward(self, inp):
+        x = self.dwconv_k5(inp)
+        channel_feature = self.channel_diversity(x)
+        auxiliary_feature = self.conv11(x)
+
+        attention = self.conv2(x) * self.attgamma + self.conv211(x)
+        unfolded_feature = self.conv21(self.conv1(x))
+        spatial_feature = SDE(
+            unfolded_feature,
+            attention,
+            self.k,
+            self.g,
+            self.b,
+            self.w,
+        ) * self.ga1 + unfolded_feature
+
+        return self.fusion(channel_feature + auxiliary_feature + spatial_feature) * inp
 
 @ARCH_REGISTRY.register()
 class BiSTAVSR(nn.Module):
-    """Bidirectional Spatio-Temporal Attention Network for Video Super-Resolution
+    """Offset-Aware Bidirectional Spatio-Temporal Aggregation for VSR.
 
     A video super-resolution architecture that integrates:
     1. Keyframe feature extraction via EDVR-based pyramid alignment
     2. Bidirectional temporal propagation with flow-guided warping
-    3. Offset-Aware Refinement (OAR) for enhanced spatial sampling
+    3. Offset-Aware Refinement (OAR) for structure-guided matching
     4. Bidirectional Spatio-Temporal Aggregator (BiSTA) for symmetric
        neighborhood feature fusion
     5. Parallel High-frequency Aware Structure Enhancement (PHASE) for
@@ -97,7 +159,7 @@ class BiSTAVSR(nn.Module):
         # Replaces VSRDetailEnhance with PHASE
         self.upconv1_s = nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1, bias=True)
         self.upconv2_s = nn.Conv2d(num_feat, 64 * 4, 3, 1, 1, bias=True)
-        self.detail_enhance = PHASE(channels=64, res_scale=1.0)
+        self.detail_enhance = PHASE(channels=64)
         self.conv_hr_s = nn.Conv2d(64, 64, 3, 1, 1)
         self.detail_alpha = nn.Parameter(torch.tensor(0.05))
         self.conv_last_s = nn.Conv2d(64, 3, 3, 1, 1)
@@ -109,6 +171,44 @@ class BiSTAVSR(nn.Module):
         # Replaces AttentionEGA with OAR
         self.offset_guidance = OAR(num_feat)
         self.made = MADE()  # Multi-Axis Diversity Enhancement
+
+    @staticmethod
+    def convert_state_dict(state_dict):
+        """Map training-code names to the paper-aligned module names.
+
+        The released architecture uses BiSTA/OAR/PHASE terminology, while the
+        experiment code used ``attention``, ``attn_ega`` and the original
+        detail-branch submodule names. This conversion keeps the trained
+        checkpoints loadable with ``strict=True``.
+        """
+        prefix_map = (
+            ('attention.da_layer1.', 'temporal_agg.aggregator.'),
+            ('attn_ega.', 'offset_guidance.'),
+            ('detail_enhance.sc.sru.', 'detail_enhance.feb.cgf.'),
+            ('detail_enhance.sc.cru.', 'detail_enhance.feb.cca.'),
+            ('detail_enhance.scharr.', 'detail_enhance.spe.'),
+            ('detail_enhance.grad.', 'detail_enhance.mde.'),
+        )
+
+        converted = state_dict.__class__()
+        if hasattr(state_dict, '_metadata'):
+            converted._metadata = state_dict._metadata
+        for key, value in state_dict.items():
+            new_key = key
+            for old_prefix, new_prefix in prefix_map:
+                if key.startswith(old_prefix):
+                    new_key = new_prefix + key[len(old_prefix):]
+                    break
+            converted[new_key] = value
+        return converted
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        state_dict = self.convert_state_dict(state_dict)
+        try:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        except TypeError:
+            # Compatibility with PyTorch versions before the ``assign`` flag.
+            return super().load_state_dict(state_dict, strict=strict)
 
     def pad_spatial(self, x: torch.Tensor) -> torch.Tensor:
         """Pad input to ensure resolution is divisible by 4 (for EDVR compatibility)."""

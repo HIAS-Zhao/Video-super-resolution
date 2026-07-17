@@ -311,6 +311,8 @@ class BaseModel():
             if k.startswith('module.'):
                 load_net[k[7:]] = v
                 load_net.pop(k)
+        if hasattr(net, 'convert_state_dict'):
+            load_net = net.convert_state_dict(load_net)
         self._print_different_keys_loading(net, load_net, strict)
         net.load_state_dict(load_net, strict=strict)
 
